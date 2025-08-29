@@ -1,0 +1,335 @@
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+import os, re, json, ast, argparse, torch 
+from datasets import load_dataset 
+from trl import SFTTrainer, SFTConfig, DPOTrainer, DPOConfig
+from peft import LoraConfig, PeftModel, get_peft_model, TaskType, prepare_model_for_kbit_training
+class DPOContrastiveTrinaer(DPOTrainer):
+  def __init__(self, contrastive_weight =1.0, *args, **kwargs):
+    suepr().__init__(*args, **kwargs)
+    self.contrastive_weight=contrastive_weight
+  def compute_loss(self, model,inputs,return_outputs=False):
+    loss, output =super().compute_loss(model,input,return_outputs=True)
+    input_ids = inputs['input_ids']
+    chosen_input_ids = inputs["chosen_input_ids"]  
+    rejected_input_ids = inputs["rejected_input_ids"]
+    
+    outputs_anchor = model(input_ids=input_ids, output_hidden_states=True, return_dict=True)
+    anchor_embeds = outputs_anchor.hidden_states[-1][:,0,:]  
+
+    outputs_chosen = model(input_ids=chosen_input_ids, output_hidden_states=True, return_dict=True)
+    chosen_embeds = outputs_chosen.hidden_states[-1][:,0,:]
+
+    outputs_rejected = model(input_ids=rejected_input_ids, output_hidden_states=True, return_dict=True)
+    rejected_embeds = outputs_rejected.hidden_states[-1][:,0,:]
+    
+    anchor_embeds = F.normalize(anchor_embeds, p=2 ,dim=1)
+    chosen_embeds= F.normalize(chosen_embeds, p=2, dim=1)
+    rejected_embeds =F.normalize(rejected_embeds, p=2 ,dim=1)
+    
+    margin =0.2
+    triple_loss_fn = torch.nn.TripletMarginLoss(margin=margin)
+    contrastive_loss = triplet_loss_fn(anchor_embeds,chosen_embeds,rejected_embeds)
+    total_loss = loss + self.contrastive_weight * contrastive_loss
+    
+    if return_outputs:
+      return total_loss,outputs
+    else:
+      return total_loss
+SYSTEM_PROMPT = (
+    "You are a linguistics span extractor.\n"
+    "Return ONLY a JSON array of strings (no extra text before/after).\n"
+    "Every string MUST be a verbatim substring of the INPUT (character-for-character), "
+    "preserving case, punctuation, and whitespace.\n"
+    "Do NOT paraphrase, normalize, or reorder text. Do NOT add labels or explanations.\n"
+    "No duplicates. Keep spans in left-to-right order as they appear in the INPUT.\n"
+    "If there is no valid span, return [] exactly.\n"
+    "Never include anyadditional text in the output."
+) 
+
+MODEL_NAME = "microsoft/phi-1_5" 
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
+if tokenizer.pad_token is None:
+  tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "right"
+print(MODEL_NAME)
+peft_config = LoraConfig(
+      r=8,
+      lora_alpha=16,
+      lora_dropout=0.1,
+      bias="none",
+      task_type=TaskType.CAUSAL_LM,
+      target_modules=["q_proj", "v_proj"],
+  )
+bnb_config = BitsAndBytesConfig(
+      load_in_4bit=True,
+      bnb_4bit_compute_dtype=torch.float16,
+      bnb_4bit_use_double_quant=True,
+      bnb_4bit_quant_type="nf4",
+  )
+def build_user_text(ex):
+    if "prompt" in ex and ex["prompt"]:
+        return ex["prompt"].strip()
+    inst = (ex.get("instruction") or "").strip()
+    inp  = (ex.get("input") or "").strip()
+    return f"Instruction: {inst}\nInput: {inp}".strip()
+
+def build_message(ex):
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": build_user_text(ex)},
+    ]
+    return messages
+
+def normalize_to_json(x):
+    if isinstance(x, str):
+        try:
+            v = json.loads(x)
+            if isinstance(v, list):
+                return json.dumps([str(s).strip() for s in v], ensure_ascii=False)
+        except: pass
+        try:
+            v = ast.literal_eval(x)
+            if isinstance(v, list):
+                return json.dumps([str(s).strip() for s in v], ensure_ascii=False)
+        except:
+            return json.dumps([x.strip()], ensure_ascii=False)
+    elif isinstance(x, list):
+        return json.dumps([str(s).strip() for s in x], ensure_ascii=False)
+    return json.dumps([str(x).strip()], ensure_ascii=False)
+    
+def dpo_preprocess(examples):
+  batch_size = len(examples[next(iter(examples))])
+  prompts , chosens ,rejecteds = [], [] ,[]
+   
+  for i in range(batch_size):
+    ex = {k: examples[k][i] for k in examples}
+    message =build_message(ex)
+    prompt = tokenizer.apply_chat_template(message, tokenize=False,add_generation_prompt=True)
+    prompts.append(prompt)
+    chosens.append(normalize_to_json(examples['output'][i]) + tokenizer.eos_token)
+    rejecteds.append(normalize_to_json(examples['rejected'][i])+ tokenizer.eos_token)
+  return {"prompt": prompts, "chosen": chosens, "rejected" :rejecteds}
+
+def build_ref(prev_outdir=None):
+  ref_base = AutoModelForCausalLM.from_pretrained(
+  MODEL_NAME, quantization_config = bnb_config, torch_dtype= torch.float16)
+  ref_base.config.use_cache=False
+  if prev_outdir:
+    ref = PeftModel.from_pretrained(ref_base , prev_outdir)
+  else:
+    ref= ref_base
+  ref.eval()
+  for p in ref.parameters():
+    p.requires_grad_(False)
+  return ref
+
+def sft_preprocess(examples,max_seq_length=1024):
+  batch_size= len(examples['prompt'])
+  prompts ,targets = [] ,[]
+  
+  for i in range(batch_size):
+    ex = {k: examples[k][i] for k in examples}
+    msgs = build_message(ex)
+    prompt_text = tokenizer.apply_chat_template(
+        msgs, tokenize=False, add_generation_prompt=True
+    )
+    prompts.append(prompt_text)
+
+    
+    outs = examples.get("output", None)
+    if 'chosen' in examples and examples['chosen'] is not None:
+      out_obj = examples['chosen'][i]
+    elif 'output' in examples and examples['output'] is not None:
+      out_obj = examples['output'][i]
+    else:
+      out_obj = "[]"
+    target_text = normalize_to_json(out_obj) + tokenizer.eos_token 
+    targets.append(target_text)
+  full_texts = [p + t for p, t in zip(prompts, targets)]
+
+ 
+  enc = tokenizer(
+      full_texts,
+      padding="max_length",
+      truncation=True,
+      max_length=max_seq_length,
+      add_special_tokens=False,
+      return_tensors="pt",
+  )
+  input_ids = enc["input_ids"]              
+  attn_mask = enc["attention_mask"]
+  labels    = input_ids.clone()
+
+  
+  prompt_tok = tokenizer(
+        prompts,
+        padding=False,
+        truncation=True,
+        max_length=max_seq_length,
+        add_special_tokens=False,
+        return_tensors=None,
+    )
+  prompt_len_list = [len(x) for x in prompt_tok["input_ids"]]
+
+  B, L = input_ids.size()
+  for i in range(B):
+       
+    labels[i][attn_mask[i] == 0] = -100
+    
+    p_len = min(prompt_len_list[i], L)
+    labels[i][:p_len] = -100
+
+  return {
+      "input_ids": input_ids.tolist(),
+      "attention_mask": attn_mask.tolist(),
+      "labels": labels.tolist(),
+  }
+def get_latest_checkpoint(dirpath: str):
+    if not os.path.isdir(dirpath):
+        return None
+    cand = []
+    for name in os.listdir(dirpath):
+        m = re.match(r"checkpoint-(\d+)$", name)
+        if m:
+            cand.append((int(m.group(1)), name))
+    if not cand:
+        return None
+    cand.sort(reverse=True)
+    return os.path.join(dirpath, cand[0][1])  
+def main():
+  ap=argparse.ArgumentParser()
+  ap.add_argument("--stage", required=True, choices=["sft","low","medium","high"])
+  #ap.add_argument("--out_root", default="llama_models/llama_curriculum_dpo_sample/2targets_20P_strong")
+  ap.add_argument("--out_root", default="phi_models/phi_curriculum_dpo_sample/2targets_20P_strong")
+  ap.add_argument("--epochs", type=int, default=1)
+  ap.add_argument("--lr", type=float, default=5e-6)
+  ap.add_argument("--beta", type=float, default=0.05)
+  ap.add_argument("--sft_dir", type=str, default=None)
+  args = ap.parse_args()
+  outdir = f"{args.out_root}/{args.stage}"
+  
+  
+  
+  sft_config = SFTConfig(
+      output_dir=outdir,
+      num_train_epochs=1,
+      per_device_train_batch_size=2,
+      gradient_accumulation_steps=1,
+      report_to="wandb",
+      learning_rate=2e-4,
+      logging_steps=10,
+      logging_dir="./logs",
+      save_strategy="steps",
+      save_steps=10,
+      save_total_limit=3,
+      bf16=False,    
+      fp16=False, 
+      optim="adamw_torch",
+      packing=False,
+      deepspeed="configs/zero_stage_2.json",
+      label_names=["labels"],
+       save_safetensors=True
+  
+      
+     
+  )
+  dpo_config = DPOConfig(
+          output_dir=outdir,
+          per_device_train_batch_size=8,          
+          gradient_accumulation_steps=8,           
+          num_train_epochs=1,
+          learning_rate=args.lr,
+          beta=args.beta,
+          max_prompt_length=512,
+          max_length=1024,
+          save_steps=200,
+          save_total_limit=3,
+          logging_steps=10,
+          remove_unused_columns=False,
+          deepspeed="configs/zero_stage_2.json",
+          lr_scheduler_type="cosine",
+          warmup_ratio=0.1,
+          report_to="wandb",
+          bf16=False,
+          fp16=False,
+          gradient_checkpointing=True,
+           save_safetensors=True
+      )
+  
+  latest_ckpt = get_latest_checkpoint(outdir)
+  
+  
+  if args.stage =="sft":
+    dataset_sft = load_dataset("haeunkim/curriculum_5pct_sample_and_dpo_pool_20P",split='sample_sft')
+    tokenized_sft = dataset_sft.map(
+    lambda x: sft_preprocess(x, max_seq_length=1024), 
+    remove_columns=dataset_sft.column_names,
+    batched=True,
+    batch_size=32,
+    load_from_cache_file=True
+)
+    tokenized_sft.set_format(type="torch", columns=["input_ids","attention_mask","labels"])
+    base = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME, quantization_config=bnb_config, torch_dtype=torch.float16
+    )
+    base = prepare_model_for_kbit_training(base)
+    
+   
+    base.config.use_cache = False
+    
+    trainer=SFTTrainer(
+    model=base,
+    args=sft_config,
+    peft_config=peft_config,
+    train_dataset=tokenized_sft,
+    processing_class=tokenizer)
+
+    trainer.train(resume_from_checkpoint=latest_ckpt if latest_ckpt else None)
+    trainer.model.save_pretrained(outdir)
+    tokenizer.save_pretrained(outdir)
+    return 
+  else:
+    split_name = {"low":"train_low", "medium":"train_medium", "high":"train_high"}[args.stage]
+    raw = load_dataset("haeunkim/curriculum_learning_dpo_created_negative", split=split_name)
+    ds_dpo = raw.map(lambda ex: dpo_preprocess(ex), batched=True,
+                     remove_columns=raw.column_names, load_from_cache_file=True)
+
+    base = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME, quantization_config=bnb_config, torch_dtype=torch.float16
+    )
+    base = prepare_model_for_kbit_training(base)
+
+    if args.stage == "low":
+        
+      sft_ckpt = args.sft_dir if args.sft_dir else f"{args.out_root}/sft"
+      if os.path.isdir(sft_ckpt):
+        print(sft_ckpt)
+        policy = PeftModel.from_pretrained(base, sft_ckpt, is_trainable=True)
+        ref    = build_ref(prev_outdir=sft_ckpt)
+      else:
+        print("**********************************no sft*************")
+        policy = get_peft_model(base, peft_config)
+        ref    = build_ref(prev_outdir=None)
+    else:
+      prev_outdir = f"{args.out_root}/{'low' if args.stage=='medium' else 'medium'}"  
+      policy = PeftModel.from_pretrained(base, prev_outdir, is_trainable=True)
+      ref    = build_ref(prev_outdir=prev_outdir)
+    policy.config.use_cache = False
+    trainer = DPOContrastiveTrinaer(
+        model=policy,
+        ref_model=ref,
+        args=dpo_config,
+        train_dataset=ds,
+        eval_dataset=None,
+        processing_class=tokenizer,
+    )
+    trainer.train(resume_from_checkpoint=latest_ckpt if latest_ckpt else None)
+    trainer.model.save_pretrained(outdir)
+    tokenizer.save_pretrained(outdir)
+
+if __name__ == "__main__":
+    main()
+
+    
+  
+    
