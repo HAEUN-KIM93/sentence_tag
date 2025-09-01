@@ -5,9 +5,28 @@ import torch.nn.functional as F
 from trl import SFTTrainer, SFTConfig, DPOTrainer, DPOConfig
 from peft import LoraConfig, PeftModel, get_peft_model, TaskType, prepare_model_for_kbit_training
 import torch
-import torch.nn.functional as F
+import torch.nn as nn
+
 from trl import DPOTrainer
-MODEL_NAME =  "microsoft/phi-1_5"
+
+parse=argparse.ArgumentParser()
+  parse.add_argument("--stage", required=True, choices=["sample_dpo","low","medium","high","only_dpo",])
+  parse.add_argument("--model",required=True,choices=['phi','llama']
+  parse.add_argument("--output_dir", default="phi_models/phi_curriculum_dpo_sample/2targets_20P_strong")
+  parse.add_argument("--epochs", type=int, default=1)
+  parse.add_argument("--lr", type=float, default=5e-6)
+  parse.add_argument("--beta", type=float, default=0.05)
+  parse.add_argument("--sft_dir", type=str, default=None)
+  parse.add_argument("--margin", type=float, default=1.0)
+  parse.add_argument("--contra_weight", type=float, default=0.2)
+  parse.add_argument("--two_layer",action="store_true")
+  parse.add_argument("--proj_dim", type=int, default=None)
+  parse.add_argument("--concat_forward",action="store_true")
+  args = parse.parse_args()
+if args.model=='phi':  
+  MODEL_NAME =  "microsoft/phi-1_5"
+else:
+  MODEL_NAME = "meta-llama/Meta-Llama-3-8B-Instruct"
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
 if tokenizer.pad_token is None:
   tokenizer.pad_token = tokenizer.eos_token
@@ -15,19 +34,42 @@ tokenizer.padding_side = "right"
 
 class DPOContrastiveTrainer(DPOTrainer):
   
-  def __init__(self,*args, beta: float = 0.1, contrastive_weight: float = 0.2, margin: float = 0.01, **kwargs):
+  def __init__(self,*args, beta: float = 0.1, contrastive_weight: float = 0.2, margin: float = 0.01,two_layer_head:bool =True, concat_forward:bool=False,project_dim:int |None=None, **kwargs):
     super().__init__(*args, **kwargs)
     self.beta = beta
     self.contrastive_weight = contrastive_weight
     self.triplet = torch.nn.TripletMarginLoss(margin=margin, reduction="mean")
-    self._pad_id = (getattr(tokenizer, "pad_token_id", None)
-                        or getattr(tokenizer, "eos_token_id", None) or 0)
-    print(f'margin:{margin}')
+    self._pad_id = getattr(tokenizer, "pad_token_id", getattr(tokenizer, "eos_token_id", 0))
+    self.concat_forward = concat_forward
+    self.two_layer_head = two_layer_head
+    
+    if project_dim is not None:
+      self.attach_proj_head(self.model, dim=project_dim)
+  
   def _ensure_mask(self,ids, mask): #mask
     if mask is None:
         return torch.ones_like(ids, dtype=torch.long, device=ids.device)
     return mask
   
+  
+  def attach_proj_head(self,model,dim=None):
+    H = model.config.hidden_size
+    D = dim or H
+    if self.two_layer_head:
+      
+      head = nn.Sequential(
+              nn.Linear(H,H),
+              nn.ReLU(),
+              nn.Linear(H,D))
+    else:
+      
+      head = nn.Linear(H,D, bias=False)
+
+    head.to(next(model.parameters()).device).to(dtype=next(model.parameters()).dtype)
+    model.proj_head = head   
+    
+    return model    
+    
   def _pad_to_len(self,ids,mask,Lmax): # padding 
     
     B , L = ids.size()
@@ -36,7 +78,22 @@ class DPOContrastiveTrainer(DPOTrainer):
     pad_ids =torch.full((B,Lmax -L),self._pad_id,dtype=ids.dtype,device=ids.device)
     pad_mask = torch.zeros((B, Lmax - L), dtype=mask.dtype, device=mask.device)
     return torch.cat([ids, pad_ids], dim=1), torch.cat([mask, pad_mask], dim=1)
-  
+ 
+  def forward_pool(self,model,ids,mask,):
+ 
+    out = model(input_ids=ids, 
+                attention_mask=mask,
+                output_hidden_states=True,
+                return_dict=True)
+    #(3b,l,h)->(3b,h) or (b,l,h)->(b,h)
+    last =out.hidden_states[-1]
+    #(3b,h)->(3b,h,1)or (b,h)->(b,h,1 or )
+    m=mask.float().unsqueeze(-1)
+    pooled = (last *m).sum(dim=1)/m.sum(dim=1).clamp_min(1e-9)
+    z = model.proj_head(pooled) if hasattr(model, "proj_head") else pooled
+    
+    return F.normalize(z,p=2,dim=1) 
+
   def compute_loss(self,model,inputs,return_outputs:bool=False,num_items_in_batch:int |None=None,**kwargs):
     
     try:
@@ -45,12 +102,13 @@ class DPOContrastiveTrainer(DPOTrainer):
             base_loss, base_outputs = super().compute_loss(     
                 model, inputs, return_outputs=True
             )
+    #ANCHOR
     a_ids = inputs.get("prompt_input_ids", inputs.get("input_ids", inputs["chosen_input_ids"]))
     a_ms  = self._ensure_mask(a_ids, inputs.get("prompt_attention_mask", inputs.get("attention_mask")))
-    
+    #POSITIVE
     p_ids = inputs["chosen_input_ids"]
     p_ms  = self._ensure_mask(p_ids, inputs.get("chosen_attention_mask"))
-    
+    #NEGATIVE
     n_ids = inputs["rejected_input_ids"]
     n_ms  = self._ensure_mask(n_ids, inputs.get("rejected_attention_mask"))
     
@@ -59,50 +117,35 @@ class DPOContrastiveTrainer(DPOTrainer):
     p_ids ,p_ms =self._pad_to_len(p_ids, p_ms, Lmax)
     n_ids ,n_ms = self._pad_to_len(n_ids,n_ms,Lmax)
     
-    all_ids = torch.cat([a_ids,p_ids,n_ids],dim=0)
-    all_mask =torch.cat([a_ms,p_ms,n_ms],dim=0)
+    if self.concat_forward:
+      all_ids = torch.cat([a_ids,p_ids,n_ids],dim=0)
+      all_mask =torch.cat([a_ms,p_ms,n_ms],dim=0)
+      z=self.forward_pool(model,all_ids,all_mask)
+      B=a_ids.size(0)
+      a,p,n = torch.split(z,[B,B,B],dim=0)
     
-    out = model(input_ids=all_ids, 
-                attention_mask=all_mask,
-                output_hidden_states=True,
-                return_dict=True)
-    #(3b,l,h)->(3b,h)
-    last =out.hidden_states[-1]
-    #(3b,h)->(3b,h,1)
-    m=all_mask.float().unsqueeze(-1)
-    pooled = (last *m).sum(dim=1)/m.sum(dim=1).clamp_min(1.0)
-    
-    B = a_ids.size(0)
-    a,p,n = torch.split(pooled, [B,B,B],dim=0) 
-    a= F.normalize(a,p=2,dim=1)
-    p=F.normalize(p,p=2,dim=1)
-    n=F.normalize(n,p=2,dim=1)
+    else:
+      a = self.forward_pool(model,a_ids,a_ms)
+      p = self.forward_pool(model,p_ids,p_ms)
+      n = self.forward_pool(model,n_ids,n_ms)
+  
     c_loss = self.triplet(a,p,n)
     total = base_loss +c_loss *self.contrastive_weight
     
     if return_outputs:
-      
       out_dict=dict(base_outputs)
       out_dict['base_loss']=base_loss.detach()
       out_dict['contrastive_loss'] =c_loss.detach()
       return total, out_dict
-    
     return total
     
-              
-  
     
-  
-
 SYSTEM_PROMPT = (
-    "You are a linguistics span extractor.\n"
-    "Return ONLY a JSON array of strings (no extra text before/after).\n"
-    "Every string MUST be a verbatim substring of the INPUT (character-for-character), "
-    "preserving case, punctuation, and whitespace.\n"
-    "Do NOT paraphrase, normalize, or reorder text. Do NOT add labels or explanations.\n"
-    "No duplicates. Keep spans in left-to-right order as they appear in the INPUT.\n"
-    "If there is no valid span, return [] exactly.\n"
-    "Never include any additional text in the output."
+    """You are a span extractor.
+Reply with a JSON array of strings only.
+Each string must be an exact substring of the INPUT.
+Keep left-to-right order and remove duplicates.
+If none, return []."""
 ) 
 
 
@@ -113,6 +156,7 @@ peft_config = LoraConfig(
       bias="none",
       task_type=TaskType.CAUSAL_LM,
       target_modules=["q_proj", "v_proj"],
+      modules_to_save=["proj_head"],
   )
 
 def build_user_text(ex):
@@ -258,16 +302,7 @@ def get_latest_checkpoint(dirpath: str):
 
      
 def main():
-  ap=argparse.ArgumentParser()
-  ap.add_argument("--stage", required=True, choices=["sample_dpo","low","medium","high","only_dpo",])
   
-  ap.add_argument("--output_dir", default="phi_models/phi_curriculum_dpo_sample/2targets_20P_strong")
-  ap.add_argument("--epochs", type=int, default=1)
-  ap.add_argument("--lr", type=float, default=5e-6)
-  ap.add_argument("--beta", type=float, default=0.05)
-  ap.add_argument("--sft_dir", type=str, default=None),
-
-  args = ap.parse_args()
   outdir = f"{args.output_dir}/{args.stage}"
   
   
@@ -297,9 +332,9 @@ def main():
   )
   dpo_config = DPOConfig(
           output_dir=outdir,
-          per_device_train_batch_size=4,          
+          per_device_train_batch_size=2,          
           gradient_accumulation_steps=8,           
-          num_train_epochs=3,
+          num_train_epochs=args.epochs,
           learning_rate=args.lr,
           beta=args.beta,
           max_prompt_length=128,
@@ -308,7 +343,8 @@ def main():
           save_total_limit=3,
           logging_steps=10,
           remove_unused_columns=False,
-          deepspeed="configs/zero_stage_2.json",
+          #deepspeed="configs/zero_stage_2.json",
+          deepspeed=None,
           lr_scheduler_type="cosine",
           warmup_ratio=0.1,
           report_to="wandb",
@@ -323,6 +359,7 @@ def main():
   
   
   if args.stage =="sample_dpo":
+    #after sft
     dataset_low = load_dataset("haeunkim/curriculum_learning_dpo_created_negative",split='train_low')
     dataset_medium = load_dataset("haeunkim/curriculum_learning_dpo_created_negative",split='train_medium')
     dataset_high = load_dataset("haeunkim/curriculum_learning_dpo_created_negative",split='train_high')
@@ -331,7 +368,7 @@ def main():
     dataset = dataset_total.shuffle(seed=42).select(range(n))
     
     
-    tokenized_dpo = dataset.map(
+    ds_dpo = dataset.map(
     lambda x: dpo_preprocess(x), 
     remove_columns=dataset.column_names,
     batched=True,
@@ -352,20 +389,26 @@ def main():
         model=model,
         ref_model=build_ref(f"{args.output_dir}/high"),
         args=dpo_config,
-        train_dataset=tokenized_dpo,
+        train_dataset=ds_dpo,
         eval_dataset=None,
         processing_class=tokenizer,  
-        contrastive_weight=0.2  
-                                        
-    )
-    
-  
+        contrastive_weight=args.contra_weight ,
+        margin=args.margin,
+        project_dim=args.proj_dim,
+        concat_forward=args.concat_forward,
+        two_layer_head=args.two_layer)
+        
     trainer.train()
     trainer.model.save_pretrained(outdir)
     tokenizer.save_pretrained(outdir)
     return 
+    
   elif args.stage=='only_dpo':
-    raw = load_dataset("haeunkim/sentence_tag_dpo_train_v2",split='train')
+  
+    raw_low = load_dataset("haeunkim/curriculum_learning_dpo_negative",split='train_low')
+    raw_me = load_dataset("haeunkim/curriculum_learning_dpo_negative",split='train_medium')
+    raw_high = load_dataset("haeunkim/curriculum_learning_dpo_negative",split='train_high')
+    raw=concatenate_datasets([raw_low,raw_me,raw_high])
     ds_dpo = raw.map(lambda ex: dpo_preprocess(ex), batched=True,
                      remove_columns=raw.column_names, load_from_cache_file=True)
 
@@ -383,30 +426,51 @@ def main():
         train_dataset=ds_dpo,
         eval_dataset=None,
         processing_class=tokenizer,  
-        contrastive_weight=0.2 ,
-        margin=1.0
+        contrastive_weight=args.contra_weight ,
+        project_dim=args.proj_dim,
+        margin=args.margin,
+        concat_forward=args.concat_forward,
+        two_layer_head=args.two_layer)
+        
                                         
-    )
-    trainer.train(resume_from_checkpoint=latest_ckpt if latest_ckpt else None)
+    if args.two_layer:
+      head_tag='mlp'
+    else:
+      head_tag='linear' 
+    if args.concat_forward:
+      concat_tag = "concat"
+    else:
+      concat_tag='separate'
+    outdir = f"{args.output_dir}/{head_tag}_{concat_tag}/margin_{args.margin}_weight_{args.contra_weight}_epoch_{args.epochs}"
+    os.makedirs(outdir, exist_ok=True)
+    
+    trainer.train()
     trainer.model.save_pretrained(outdir)
+   
     tokenizer.save_pretrained(outdir)
+    with open(os.path.join(outdir, "train_config.txt"), "w") as f:
+      f.write(f"margin={args.margin}\n")
+      f.write(f"contra_weight={args.contra_weight}\n")
+      f.write(f"epochs={args.epochs}\n")
+      f.write(f"learning_rate={args.lr}\n")
+      f.write(f"beta={args.beta}\n")
     return  
   
   else:
     split_name = {"low":"train_low", "medium":"train_medium", "high":"train_high"}[args.stage]
-    raw = load_dataset("haeunkim/curriculum_learning_dpo_created_negative", split=split_name)
+    raw = load_dataset("haeunkim/curriculum_learning_sft_dpo_negative", split=split_name)
     ds_sft = raw.map(lambda ex: sft_preprocess(ex), batched=True,
                      remove_columns=raw.column_names, load_from_cache_file=True)
     ds_sft.set_format(type="torch", columns=["input_ids","attention_mask","labels"])
     if args.stage=='low':
       n = int(len(ds_sft) * 0.4)
-      ds_sft.shuffle(seed=42).select(range(n))
+      ds_sft=ds_sft.shuffle(seed=42).select(range(n))
     elif args.stage=='medium':
       n = int(len(ds_sft) * 0.2)
-      ds_sft.shuffle(seed=42).select(range(n))
+      ds_sft=ds_sft.shuffle(seed=42).select(range(n))
     elif args.stage=='high':
       n = int(len(ds_sft) * 0.1)
-      ds_sft.shuffle(seed=42).select(range(n))
+      ds_sft=ds_sft.shuffle(seed=42).select(range(n))
     base = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME, torch_dtype=torch.float16
     )
