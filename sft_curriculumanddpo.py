@@ -312,11 +312,13 @@ def main():
 )
   sft_config = SFTConfig(
       output_dir=outdir,
-      num_train_epochs=1,
+      num_train_epochs=args.epochs,
       per_device_train_batch_size=4,
       gradient_accumulation_steps=4,
       report_to="wandb",
       learning_rate=2e-4,
+      eval_strategy='steps',
+      eval_steps=200,
       logging_steps=10,
       logging_dir="./logs",
       save_strategy="steps",
@@ -338,6 +340,8 @@ def main():
           per_device_train_batch_size=2,          
           gradient_accumulation_steps=8,           
           num_train_epochs=args.epochs,
+          eval_strategy='steps',
+          eval_steps=200,
           learning_rate=args.lr,
           beta=args.beta,
           max_prompt_length=128,
@@ -365,10 +369,11 @@ def main():
   if args.stage =="sft_lite":
     #after sft
     
-    ds_low = load_dataset("haeunkim/curriculum_learning_dpo_created_negative",split='train_low')
-    ds_me = load_dataset("haeunkim/curriculum_learning_dpo_created_negative",split='train_medium')
-    ds_high = load_dataset("haeunkim/curriculum_learning_dpo_created_negative",split='train_high')
+    ds_low = load_dataset("haeunkim/final_dataset",split='train_low')
+    ds_me = load_dataset("haeunkim/final_dataset",split='train_medium')
+    ds_high = load_dataset("haeunkim/final_dataset",split='train_high')
     dataset_total=concatenate_datasets([ds_low,ds_me,ds_high])
+    ds_eval = load_dataset("haeunkim/final_dataset",split='eval')
     n=int(len(dataset_total)*0.2)
     sft_lite = dataset_total.shuffle(seed=42).select(range(n))
     
@@ -376,6 +381,13 @@ def main():
     ds_sft = sft_lite.map(
     lambda x: sft_preprocess(x), 
     remove_columns=sft_lite.column_names,
+    batched=True,
+    batch_size=32,
+    load_from_cache_file=True
+)   
+    ds_sft_eval = ds_eval.map(
+    lambda x: sft_preprocess(x), 
+    remove_columns=ds_eval.column_names,
     batched=True,
     batch_size=32,
     load_from_cache_file=True
@@ -393,8 +405,10 @@ def main():
     trainer=SFTTrainer(
     model=model,
     args=sft_config,
+    
     peft_config=None,
     train_dataset=ds_sft,
+    eval_dataset=ds_sft_eval,
     processing_class=tokenizer)
     trainer.train(resume_from_checkpoint=latest_ckpt if latest_ckpt else None)
     trainer.model.save_pretrained(outdir)
@@ -405,14 +419,21 @@ def main():
   elif args.stage =="curriculum_lite":
      #curriculum sft
     
-    ds_low   = load_dataset("haeunkim/curriculum_learning_dpo_negative",split='train_low')
-    ds_me   = load_dataset("haeunkim/curriculum_learning_dpo_negative",split='train_medium')
-    ds_high = load_dataset("haeunkim/curriculum_learning_dpo_negative",split='train_high')
-    
+    ds_low   = load_dataset("haeunkim/final_dataset",split='train_low')
+    ds_me   = load_dataset("haeunkim/final_dataset",split='train_medium')
+    ds_high = load_dataset("haeunkim/final_dataset",split='train_high')
+    ds_eval= load_dataset("haeunkim/final_dataset",split='eval')
     n_low=int(len(ds_low)*0.4)
     n_me=int(len(ds_me)*0.2)
     n_high = int(len(ds_high)*0.1)
-    
+    ds_sft_eval = ds_eval.map(
+            sft_preprocess,
+            batched=True,
+            remove_columns=ds_eval.column_names,
+            load_from_cache_file=True,
+        )
+        
+    ds_sft_eval.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
     stages = [
         ("low",    ds_low,  n_low,  None),                                 
         ("medium", ds_me,  n_me,  f"{args.output_dir}/curriculum_lite/low"),   
@@ -431,6 +452,7 @@ def main():
             remove_columns=subset.column_names,
             load_from_cache_file=True,
         )
+        
         ds_sft.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
 
         if args.model=='phi':
@@ -447,10 +469,14 @@ def main():
         
         stage_outdir = os.path.join(args.output_dir, "curriculum_lite", level)
         os.makedirs(stage_outdir, exist_ok=True)
-        if level=='low' or level =='medium':
-          latest_ckpt = get_latest_checkpoint(stage_outdir)
-
-        
+       
+        latest_ckpt = get_latest_checkpoint(stage_outdir)
+        is_high = (level == "high")
+        eval_kwargs = (
+        dict(eval_strategy="steps", eval_steps=200)
+        if is_high else
+        dict(eval_strategy="no")
+)
         stage_cfg = SFTConfig(
             output_dir=stage_outdir,
             num_train_epochs=1,
@@ -469,20 +495,23 @@ def main():
             packing=False,
             label_names=["labels"],
             save_safetensors=True,
+            **eval_kwargs,
         )
 
-        # 7) 학습
+        # 7) ??
+        
         trainer = SFTTrainer(
             model=policy,
             args=stage_cfg,
             peft_config=None,       
             train_dataset=ds_sft,
+            eval_dataset=ds_sft_eval if level == "high" else None,
             processing_class=tokenizer,     
         )
         
         trainer.train(resume_from_checkpoint=latest_ckpt or None)
 
-        # 8) 저장
+        # 8) ??
         trainer.model.save_pretrained(stage_outdir)
         tokenizer.save_pretrained(stage_outdir)
 
@@ -490,13 +519,15 @@ def main():
   
   elif args.stage=='only_dpo':
   
-    raw_low = load_dataset("haeunkim/curriculum_learning_dpo_negative",split='train_low')
-    raw_me = load_dataset("haeunkim/curriculum_learning_dpo_negative",split='train_medium')
-    raw_high = load_dataset("haeunkim/curriculum_learning_dpo_negative",split='train_high')
-    raw=concatenate_datasets([raw_low,raw_me,raw_high])
+    ds_low = load_dataset("haeunkim/final_dataset",split='train_low')
+    ds_me = load_dataset("haeunkim/final_dataset",split='train_medium')
+    ds_high = load_dataset("haeunkim/final_dataset",split='train_high')
+    ds_eval = load_dataset("haeunkim/final_dataset",split='eval')
+    raw=concatenate_datasets([ds_low,ds_me,ds_high])
     ds_dpo = raw.map(lambda ex: dpo_preprocess(ex), batched=True,
                      remove_columns=raw.column_names, load_from_cache_file=True)
-
+    ds_dpo_eval=ds_eval.map(lambda ex: dpo_preprocess(ex), batched=True,
+                     remove_columns=ds_eval.column_names, load_from_cache_file=True)
     base = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME, torch_dtype=torch.float16
     )
@@ -510,7 +541,7 @@ def main():
         ref_model=ref,
         args=dpo_config,
         train_dataset=ds_dpo,
-        eval_dataset=None,
+        eval_dataset=ds_dpo_eval,
         processing_class=tokenizer,  
         contrastive_weight=args.contra_weight ,
         project_dim=args.proj_dim,
