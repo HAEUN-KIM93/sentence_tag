@@ -19,10 +19,6 @@ SYSTEM_PROMPT = (
     "preserving case, punctuation, and whitespace.\n"
     "Do NOT paraphrase, normalize, or reorder text. Do NOT add labels or explanations.\n"
     "No duplicates. Keep spans in left-to-right order as they appear in the INPUT.\n"
-     
-    """STRICT FORMAT:
-- Valid FORMAT: [], ["span"], ["span A", "span B"]
-- Invalid FORMAT: [{"text": "..." }], [{"start": 0, "end": 3}], ["span", []], true, null, numbers"""
     "If there is no valid span, return [] exactly.\n"
     "Never include any explanation or details in the output."
 )
@@ -60,23 +56,24 @@ def main():
     gen_config = GenerationConfig.from_pretrained("microsoft/phi-1_5")
     parser = argparse.ArgumentParser()
    
-    parser.add_argument("--model_name", default="microsoft/phi-1_5")
+    parser.add_argument("--model_name", default ="microsoft/phi-1_5")
     
     parser.add_argument("--adapter_path", default=None)
-    parser.add_argument("--dataset", default="haeunkim/sentence_tag_multitask_v2")
+    parser.add_argument("--dataset", default="haeunkim/final_dataset")
     parser.add_argument("--split",   default="test")
     parser.add_argument("--output_dir", default="phi_output/dpo_samplecurriculum_2targets")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_shards", type=int, default=10)
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--end",   type=int, default=10)
-    parser.add_argument("--temperature",   type=int, default=1.0)
     parser.add_argument("--max_new_tokens", type=int, default=128)
     args = parser.parse_args()
 
     print(args.adapter_path, args.output_dir)
     model_name=args.model_name
    
+    
+      
     
     
     if args.adapter_path:
@@ -111,16 +108,16 @@ def main():
 
         tokenized_shard = raw_shard.map(
             lambda ex: preprocess(tokenizer, ex),
-            remove_columns=[c for c in raw_shard.column_names if c != "output"]
+            remove_columns=[c for c in raw_shard.column_names if c != "chosen"]
         )
 
         prompt_shard = [build_prompt(tokenizer, ex) for ex in raw_shard]
-        gold_shard   = [ex["output"] for ex in raw_shard]
+        gold_shard   = [ex["chosen"] for ex in raw_shard]
 
         tokenized_shard.set_format(type="torch", columns=["input_ids", "attention_mask"])
         dataloader = DataLoader(tokenized_shard, batch_size=args.batch_size, collate_fn=collator)
         gen_config = GenerationConfig.from_pretrained(model_name)
-        gen_config.temperature = args.temperature
+        gen_config.temperature = 0.1
         gen_config.do_sample = True
         pred_texts = []
         for batch in tqdm(dataloader, desc=f"Shard {idx}"):
@@ -148,7 +145,7 @@ def main():
             "pred": pred_texts,
             "gold": gold_shard
         })
-        folder_name=f"{args.output_dir}_temp_{args.temperature}"
+
         os.makedirs(args.output_dir, exist_ok=True)
        
       
