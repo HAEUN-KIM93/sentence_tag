@@ -32,21 +32,63 @@ if tokenizer.pad_token is None:
   tokenizer.pad_token = tokenizer.eos_token
 tokenizer.padding_side = "right"
 
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4",
+)
+class Modelwithhead(nn.Module):
+    def __init__(self,base_model):
+      super().__init__()
+      self.model = base_model
+      self.config=self.model.config
+      self.warnings_issued = getattr(self.model, "warnings_issued", {})
+    
+    def forward(self, *args, compute_proj: bool = False, proj_detach: bool = False, **kwargs):
+      need_hidden = compute_proj or kwargs.get("output_hidden_states", False)
+      kwargs = dict(kwargs)
+      kwargs["output_hidden_states"] = need_hidden
+      kwargs["return_dict"] = True
+
+      out = self.model(*args, **kwargs)
+
+      if compute_proj:
+        attn = kwargs.get("attention_mask", None)
+        if attn is None:
+          raise RuntimeError("attention_mask is required when compute_proj=True")
+        last = out.hidden_states[-1]          # (B, L, H)
+        m = attn.float().unsqueeze(-1)        # (B, L, 1)
+        pooled = (last * m).sum(dim=1) / m.sum(dim=1).clamp_min(1e-9)  # (B, H)
+        if proj_detach:
+          print("detach")
+          pooled = pooled.detach()
+        z = self.model.proj_head(pooled)      # (B, D)
+        
+        setattr(out, "proj", z)  
+      return out
+    def generate(self, *args, **kwargs):
+      return self.model.generate(*args, **kwargs)
+    def save_pretrained(self, *args, **kwargs):
+        return self.model.save_pretrained(*args, **kwargs)
+  
+    
+
 class DPOContrastiveTrainer(DPOTrainer):
   
-  def __init__(self,*args, beta: float = 0.1, contrastive_weight: float = 0.2, margin: float = 0.01,two_layer_head:bool =True, concat_forward:bool=False,project_dim:int |None=None, **kwargs):
+  def __init__(self,*args, beta: float = 0.1, contrastive_weight: float = 0.2, margin: float = 0.01,two_layer_head:bool =True, project_dim:int |None=None, **kwargs):
     super().__init__(*args, **kwargs)
     self.beta = beta
     self.contrastive_weight = contrastive_weight
     self.triplet = torch.nn.TripletMarginLoss(margin=margin, reduction="mean")
-    self._pad_id = getattr(tokenizer, "pad_token_id", getattr(tokenizer, "eos_token_id", 0))
-    self.concat_forward = concat_forward
-    self.two_layer_head = two_layer_head
+    self._pad_id = getattr(self.tokenizer, "pad_token_id", getattr(self.tokenizer, "eos_token_id", 0))
     
-    if project_dim is not None:
-      self.attach_proj_head(self.model, dim=project_dim)
+    self.two_layer_head = two_layer_head
+    self.ref = getattr(self, "ref_model", getattr(self, "ref", None)) # for dpo
+    
+    policy =self._unwrap(self.model)
+    self.attach_proj_head(policy,dim=project_dim)
   
-  def _ensure_mask(self,ids, mask): #mask
+  @staticmethod
+  def ensure_mask(ids, mask): #mask
     if mask is None:
         return torch.ones_like(ids, dtype=torch.long, device=ids.device)
     return mask
@@ -64,9 +106,11 @@ class DPOContrastiveTrainer(DPOTrainer):
     else:
       
       head = nn.Linear(H,D, bias=False)
-
-    head.to(next(model.parameters()).device).to(dtype=next(model.parameters()).dtype)
-    model.proj_head = head   
+    p = next(self._unwrap(self.model).parameters())
+    head.to(p.device).to(dtype=p.dtype)
+    setattr(model,'proj_head',head)
+    if hasattr(model,'model') and not hasattr(model.model, "proj_head"):
+      setattr(model.model, "proj_head", head)
     
     return model    
     
@@ -79,21 +123,36 @@ class DPOContrastiveTrainer(DPOTrainer):
     pad_mask = torch.zeros((B, Lmax - L), dtype=mask.dtype, device=mask.device)
     return torch.cat([ids, pad_ids], dim=1), torch.cat([mask, pad_mask], dim=1)
  
-  def forward_pool(self,model,ids,mask,):
- 
-    out = model(input_ids=ids, 
+  def forward_pool(self,model,ids,mask):
+  
+    out =model(input_ids=ids, 
                 attention_mask=mask,
                 output_hidden_states=True,
                 return_dict=True)
     #(3b,l,h)->(3b,h) or (b,l,h)->(b,h)
     last =out.hidden_states[-1]
     #(3b,h)->(3b,h,1)or (b,h)->(b,h,1 or )
-    m=mask.float().unsqueeze(-1)
+    m=mask.to(dtype=last.dtype).unsqueeze(-1)
     pooled = (last *m).sum(dim=1)/m.sum(dim=1).clamp_min(1e-9)
-    z = model.proj_head(pooled) if hasattr(model, "proj_head") else pooled
     
-    return F.normalize(z,p=2,dim=1) 
+   #head = getattr(self.model, "proj_head", None)
+    #z = head(pooled) if head is not None else pooled
+    
+    return pooled 
+  def _unwrap(self, m):
+    return m.module if hasattr(m, "module") else m
 
+  def _get_head(self, model):
+    m = self._unwrap(model)
+    if hasattr(m,'proj_head'):
+      return m.proj_head
+    for c in [getattr(m, "model", None),
+                  getattr(m, "base_model", None),
+                  getattr(getattr(m, "base_model", None), "model", None)]:
+      if c is not None and hasattr(c, "proj_head"):
+        return c.proj_head
+    raise RuntimeError("proj_head not found on policy model")
+  
   def compute_loss(self,model,inputs,return_outputs:bool=False,num_items_in_batch:int |None=None,**kwargs):
     
     try:
@@ -104,33 +163,34 @@ class DPOContrastiveTrainer(DPOTrainer):
             )
     #ANCHOR
     a_ids = inputs.get("prompt_input_ids", inputs.get("input_ids", inputs["chosen_input_ids"]))
-    a_ms  = self._ensure_mask(a_ids, inputs.get("prompt_attention_mask", inputs.get("attention_mask")))
+    a_ms  = self.ensure_mask(a_ids, inputs.get("prompt_attention_mask", inputs.get("attention_mask")))
     #POSITIVE
     p_ids = inputs["chosen_input_ids"]
-    p_ms  = self._ensure_mask(p_ids, inputs.get("chosen_attention_mask"))
+    p_ms  = self.ensure_mask(p_ids, inputs.get("chosen_attention_mask"))
     #NEGATIVE
     n_ids = inputs["rejected_input_ids"]
-    n_ms  = self._ensure_mask(n_ids, inputs.get("rejected_attention_mask"))
+    n_ms  = self.ensure_mask(n_ids, inputs.get("rejected_attention_mask"))
     
     Lmax = max(a_ids.size(1),p_ids.size(1),n_ids.size(1))
-    a_ids ,a_ms=self._pad_to_len(a_ids, a_ms, Lmax)
-    p_ids ,p_ms =self._pad_to_len(p_ids, p_ms, Lmax)
-    n_ids ,n_ms = self._pad_to_len(n_ids,n_ms,Lmax)
+    a_ids , a_ms = self._pad_to_len(a_ids, a_ms, Lmax)
+    p_ids , p_ms = self._pad_to_len(p_ids, p_ms, Lmax)
+    n_ids , n_ms = self._pad_to_len(n_ids,n_ms,Lmax)
     
-    if self.concat_forward:
-      all_ids = torch.cat([a_ids,p_ids,n_ids],dim=0)
-      all_mask =torch.cat([a_ms,p_ms,n_ms],dim=0)
-      z=self.forward_pool(model,all_ids,all_mask)
-      B=a_ids.size(0)
-      a,p,n = torch.split(z,[B,B,B],dim=0)
+    policy = self._unwrap(model) # dpo loss
+    head = self._get_head(model) # contrastive loss
+    head_dtype = next(head.parameters()).dtype
+    all_ids  = torch.cat([a_ids, p_ids, n_ids], dim=0)
+    all_ms = torch.cat([a_ms,  p_ms,  n_ms],  dim=0)
     
-    else:
-      a = self.forward_pool(model,a_ids,a_ms)
-      p = self.forward_pool(model,p_ids,p_ms)
-      n = self.forward_pool(model,n_ids,n_ms)
-  
-    c_loss = self.triplet(a,p,n)
-    total = base_loss +c_loss *self.contrastive_weight
+    pooled_all = self.forward_pool(policy,all_ids,all_ms)
+    pooled_all = pooled_all.to(dtype=head_dtype) 
+    total_all = F.normalize(head(pooled_all), p=2, dim=1)
+    B = a_ids.size(0)
+    a, p, n = torch.split(total_all, [B, B, B], dim=0)   
+    c_loss = self.triplet(a, p, n)
+    
+    total = base_loss + c_loss * self.contrastive_weight
+    
     
     if return_outputs:
       out_dict=dict(base_outputs)
@@ -211,8 +271,12 @@ def dpo_preprocess(examples):
   return {"prompt": prompts, "chosen": chosens, "rejected" :rejecteds}
 
 def build_ref(prev_outdir=None):
-  ref_base = AutoModelForCausalLM.from_pretrained(
+  if args.model=='phi':
+    ref_base = AutoModelForCausalLM.from_pretrained(
   MODEL_NAME, torch_dtype= torch.float16)
+  else:
+    ref_base = AutoModelForCausalLM.from_pretrained(
+  MODEL_NAME, quantization_config=bnb_config, torch_dtype= torch.float16)
   ref_base.config.use_cache=False
   if prev_outdir:
     ref = PeftModel.from_pretrained(ref_base , prev_outdir)
@@ -306,10 +370,7 @@ def main():
   outdir = f"{args.output_dir}/{args.stage}"
   
   
-  bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16,
-    bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4",
-)
+  
   sft_config = SFTConfig(
       output_dir=outdir,
       num_train_epochs=args.epochs,
@@ -318,12 +379,12 @@ def main():
       report_to="wandb",
       learning_rate=2e-4,
       eval_strategy='steps',
-      eval_steps=200,
+      eval_steps=1000,
       logging_steps=10,
       logging_dir="./logs",
       save_strategy="steps",
-      save_steps=10,
-      save_total_limit=3,
+      save_steps=100,
+      save_total_limit=2,
       bf16=False,    
       fp16=False, 
       optim="adamw_torch",
@@ -337,18 +398,18 @@ def main():
   )
   dpo_config = DPOConfig(
           output_dir=outdir,
-          per_device_train_batch_size=2,          
+          per_device_train_batch_size=4 if args.model=='phi' else 2,          
           gradient_accumulation_steps=8,           
           num_train_epochs=args.epochs,
           eval_strategy='steps',
-          eval_steps=200,
+          eval_steps=1000,
           learning_rate=args.lr,
           beta=args.beta,
           max_prompt_length=128,
           max_length=256,
           save_steps=200,
-          save_total_limit=3,
-          logging_steps=10,
+          save_total_limit=2,
+          logging_steps=100,
           remove_unused_columns=False,
           #deepspeed="configs/zero_stage_2.json",
           deepspeed=None,
@@ -357,7 +418,9 @@ def main():
           report_to="wandb",
           bf16=False,
           fp16=False,
-            gradient_checkpointing=False,
+           gradient_checkpointing=False,
+    ddp_find_unused_parameters=False,
+    ddp_broadcast_buffers=False,
            save_safetensors=True
       )
   
@@ -458,8 +521,8 @@ def main():
         if args.model=='phi':
           base = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16)
         else:
-           base = AutoModelForCausalLM.from_pretrained(MODEL_NAME, quantization_config=bnb_config ,torch_dtype=torch.float16)
-        base = prepare_model_for_kbit_training(base)
+          base = AutoModelForCausalLM.from_pretrained(MODEL_NAME, quantization_config=bnb_config ,torch_dtype=torch.float16)
+          base = prepare_model_for_kbit_training(base)
         if prev_dir is None or not os.path.isdir(prev_dir):
             policy = get_peft_model(base, peft_config)
         else:
@@ -524,17 +587,32 @@ def main():
     ds_high = load_dataset("haeunkim/final_dataset",split='train_high')
     ds_eval = load_dataset("haeunkim/final_dataset",split='eval')
     raw=concatenate_datasets([ds_low,ds_me,ds_high])
-    ds_dpo = raw.map(lambda ex: dpo_preprocess(ex), batched=True,
-                     remove_columns=raw.column_names, load_from_cache_file=True)
+    n=int(len(raw)*0.2)
+    raw_dpo = raw.shuffle(seed=42).select(range(n))
+    ds_dpo = raw_dpo.map(lambda ex: dpo_preprocess(ex), batched=True,
+                     remove_columns=raw_dpo.column_names, load_from_cache_file=True)
     ds_dpo_eval=ds_eval.map(lambda ex: dpo_preprocess(ex), batched=True,
                      remove_columns=ds_eval.column_names, load_from_cache_file=True)
-    base = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME, torch_dtype=torch.float16
-    )
-    base = prepare_model_for_kbit_training(base)
-    policy = get_peft_model(base, peft_config)
-    ref    = build_ref(prev_outdir=None)
-    policy.config.use_cache = False
+    if args.model=='phi':
+      base = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16)
+    else:
+      base = AutoModelForCausalLM.from_pretrained(MODEL_NAME, quantization_config=bnb_config ,torch_dtype=torch.float16)
+      base = prepare_model_for_kbit_training(base)
+    H = base.config.hidden_size
+    D = args.proj_dim or H
+    if args.two_layer:
+      proj_head = nn.Sequential(nn.Linear(H,H), nn.ReLU(), nn.Linear(H,D))
+    else:
+      proj_head = nn.Linear(H, D, bias=False)
+    proj_head.to(next(base.parameters()).device).to(dtype=next(base.parameters()).dtype)
+    setattr(base, "proj_head", proj_head) 
+
+    policy_base = get_peft_model(base, peft_config)
+    policy_base.config.use_cache = False
+    setattr(base, "proj_head", proj_head)
+        # 4) 
+    policy = Modelwithhead(policy_base)
+    ref = build_ref(prev_outdir=None)
     
     trainer = DPOContrastiveTrainer(
         model=policy,
@@ -546,7 +624,6 @@ def main():
         contrastive_weight=args.contra_weight ,
         project_dim=args.proj_dim,
         margin=args.margin,
-        concat_forward=args.concat_forward,
         two_layer_head=args.two_layer)
         
                                         
@@ -581,7 +658,7 @@ def main():
     raw=concatenate_datasets([ds_low,ds_me,ds_high])
     ds_dpo = raw.map(lambda ex: dpo_preprocess(ex), batched=True,
                      remove_columns=raw.column_names, load_from_cache_file=True)
-
+    
     base = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME, torch_dtype=torch.float16
     )
