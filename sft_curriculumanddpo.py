@@ -10,18 +10,18 @@ import torch.nn as nn
 from trl import DPOTrainer
 
 parse=argparse.ArgumentParser()
-parse.add_argument("--stage", required=True, choices=["sample_dpo","sft_lite","curriculum_lite","high","only_dpo",])
+parse.add_argument("--stage", required=True, choices=["sample_dpo","sft_lite","curriculum_lite","only_dpo_contrastive","only_dpo","sft_dpo","dpo"])
 parse.add_argument("--model",required=True,choices=['phi','llama'])
 parse.add_argument("--output_dir", default="phi_models/phi_curriculum_dpo_sample/2targets_20P_strong")
 parse.add_argument("--epochs", type=int, default=1)
-parse.add_argument("--lr", type=float, default=5e-6)
+parse.add_argument("--lr", type=float, default=1e-4)
 parse.add_argument("--beta", type=float, default=0.05)
 parse.add_argument("--sft_dir", type=str, default=None)
 parse.add_argument("--margin", type=float, default=1.0)
 parse.add_argument("--contra_weight", type=float, default=0.2)
-parse.add_argument("--two_layer",action="store_true")
+
 parse.add_argument("--proj_dim", type=int, default=None)
-parse.add_argument("--concat_forward",action="store_true")
+
 args = parse.parse_args()
 if args.model=='phi':  
   MODEL_NAME =  "microsoft/phi-1_5"
@@ -72,20 +72,26 @@ class Modelwithhead(nn.Module):
   
     
 
+
 class DPOContrastiveTrainer(DPOTrainer):
   
-  def __init__(self,*args, beta: float = 0.1, contrastive_weight: float = 0.2, margin: float = 0.01,two_layer_head:bool =True, project_dim:int |None=None, **kwargs):
+  def __init__(self,*args, beta: float = 0.1, contrastive_weight: float = 0.2, margin: float = 0.01, project_dim:int |None=None, **kwargs):
+    model = kwargs.get("model", args[0] if args else None)
+    if model is None:
+        raise ValueError("model is required")
+
+    
+    self.attach_proj_head(model, dim=project_dim)
+
+    kwargs["model"] = model
     super().__init__(*args, **kwargs)
+
     self.beta = beta
     self.contrastive_weight = contrastive_weight
     self.triplet = torch.nn.TripletMarginLoss(margin=margin, reduction="mean")
     self._pad_id = getattr(self.tokenizer, "pad_token_id", getattr(self.tokenizer, "eos_token_id", 0))
-    
-    self.two_layer_head = two_layer_head
-    self.ref = getattr(self, "ref_model", getattr(self, "ref", None)) # for dpo
-    
-    policy =self._unwrap(self.model)
-    self.attach_proj_head(policy,dim=project_dim)
+    self.ref = getattr(self, "ref_model", getattr(self, "ref", None))
+
   
   @staticmethod
   def ensure_mask(ids, mask): #mask
@@ -95,22 +101,21 @@ class DPOContrastiveTrainer(DPOTrainer):
   
   
   def attach_proj_head(self,model,dim=None):
-    H = model.config.hidden_size
+    m = self._unwrap(model)
+    if hasattr(m, "proj_head"):         
+        return model
+    H = m.config.hidden_size
     D = dim or H
-    if self.two_layer_head:
+    
       
-      head = nn.Sequential(
+    head = nn.Sequential(
               nn.Linear(H,H),
               nn.ReLU(),
               nn.Linear(H,D))
-    else:
-      
-      head = nn.Linear(H,D, bias=False)
-    p = next(self._unwrap(self.model).parameters())
-    head.to(p.device).to(dtype=p.dtype)
-    setattr(model,'proj_head',head)
-    if hasattr(model,'model') and not hasattr(model.model, "proj_head"):
-      setattr(model.model, "proj_head", head)
+    
+    p = next(m.parameters())
+    head.to(p.device,dtype=p.dtype)
+    m.add_module("proj_head", head)
     
     return model    
     
@@ -128,6 +133,7 @@ class DPOContrastiveTrainer(DPOTrainer):
     out =model(input_ids=ids, 
                 attention_mask=mask,
                 output_hidden_states=True,
+                use_cache=False,
                 return_dict=True)
     #(3b,l,h)->(3b,h) or (b,l,h)->(b,h)
     last =out.hidden_states[-1]
@@ -146,11 +152,7 @@ class DPOContrastiveTrainer(DPOTrainer):
     m = self._unwrap(model)
     if hasattr(m,'proj_head'):
       return m.proj_head
-    for c in [getattr(m, "model", None),
-                  getattr(m, "base_model", None),
-                  getattr(getattr(m, "base_model", None), "model", None)]:
-      if c is not None and hasattr(c, "proj_head"):
-        return c.proj_head
+    
     raise RuntimeError("proj_head not found on policy model")
   
   def compute_loss(self,model,inputs,return_outputs:bool=False,num_items_in_batch:int |None=None,**kwargs):
@@ -176,17 +178,17 @@ class DPOContrastiveTrainer(DPOTrainer):
     p_ids , p_ms = self._pad_to_len(p_ids, p_ms, Lmax)
     n_ids , n_ms = self._pad_to_len(n_ids,n_ms,Lmax)
     
-    policy = self._unwrap(model) # dpo loss
+     # dpo loss
+    
+    with torch.no_grad():
+      a_feat = self.forward_pool(model, a_ids, a_ms)
+      p_feat = self.forward_pool(model, p_ids, p_ms)
+      n_feat = self.forward_pool(model, n_ids, n_ms)
     head = self._get_head(model) # contrastive loss
     head_dtype = next(head.parameters()).dtype
-    all_ids  = torch.cat([a_ids, p_ids, n_ids], dim=0)
-    all_ms = torch.cat([a_ms,  p_ms,  n_ms],  dim=0)
-    
-    pooled_all = self.forward_pool(policy,all_ids,all_ms)
-    pooled_all = pooled_all.to(dtype=head_dtype) 
-    total_all = F.normalize(head(pooled_all), p=2, dim=1)
-    B = a_ids.size(0)
-    a, p, n = torch.split(total_all, [B, B, B], dim=0)   
+    a = F.normalize(head(a_feat.to(head_dtype)), p=2, dim=1)
+    p = F.normalize(head(p_feat.to(head_dtype)), p=2, dim=1)
+    n = F.normalize(head(n_feat.to(head_dtype)), p=2, dim=1)
     c_loss = self.triplet(a, p, n)
     
     total = base_loss + c_loss * self.contrastive_weight
@@ -216,7 +218,7 @@ peft_config = LoraConfig(
       bias="none",
       task_type=TaskType.CAUSAL_LM,
       target_modules=["q_proj", "v_proj"],
-      modules_to_save=["proj_head"],
+      modules_to_save=["proj_head"] if args.stage=='only_dpo_contrastive' else None
   )
 
 def build_user_text(ex):
@@ -226,12 +228,7 @@ def build_user_text(ex):
     inp  = (ex.get("input") or "").strip()
     return f"Instruction: {inst}\nInput: {inp}".strip()
 
-def build_message(ex):
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user",   "content": build_user_text(ex)},
-    ]
-    return messages
+
 
 def normalize_to_json(x):
     if isinstance(x, str):
@@ -271,12 +268,10 @@ def dpo_preprocess(examples):
   return {"prompt": prompts, "chosen": chosens, "rejected" :rejecteds}
 
 def build_ref(prev_outdir=None):
-  if args.model=='phi':
-    ref_base = AutoModelForCausalLM.from_pretrained(
+  
+  ref_base = AutoModelForCausalLM.from_pretrained(
   MODEL_NAME, torch_dtype= torch.float16)
-  else:
-    ref_base = AutoModelForCausalLM.from_pretrained(
-  MODEL_NAME, quantization_config=bnb_config, torch_dtype= torch.float16)
+  
   ref_base.config.use_cache=False
   if prev_outdir:
     ref = PeftModel.from_pretrained(ref_base , prev_outdir)
@@ -310,7 +305,9 @@ def sft_preprocess(examples,max_seq_length=1024):
       out_obj = examples['output'][i]
     else:
       out_obj = "[]"
+    
     target_text = normalize_to_json(out_obj) + tokenizer.eos_token 
+    print(target_text)
     targets.append(target_text)
   full_texts = [p + t for p, t in zip(prompts, targets)]
 
@@ -379,14 +376,14 @@ def main():
       report_to="wandb",
       learning_rate=2e-4,
       eval_strategy='steps',
-      eval_steps=1000,
+      eval_steps=500,
       logging_steps=10,
       logging_dir="./logs",
       save_strategy="steps",
-      save_steps=100,
+      save_steps=10,
       save_total_limit=2,
       bf16=False,    
-      fp16=False, 
+      fp16=True, 
       optim="adamw_torch",
       packing=False,
       #deepspeed="configs/zero_stage_3.json",
@@ -398,26 +395,26 @@ def main():
   )
   dpo_config = DPOConfig(
           output_dir=outdir,
-          per_device_train_batch_size=4 if args.model=='phi' else 2,          
+          per_device_train_batch_size=4 if args.model=='phi' else 1,          
           gradient_accumulation_steps=8,           
           num_train_epochs=args.epochs,
           eval_strategy='steps',
-          eval_steps=1000,
+          eval_steps=500,
           learning_rate=args.lr,
           beta=args.beta,
           max_prompt_length=128,
           max_length=256,
-          save_steps=200,
+          save_steps=10,
           save_total_limit=2,
-          logging_steps=100,
+          logging_steps=10,
           remove_unused_columns=False,
           #deepspeed="configs/zero_stage_2.json",
-          deepspeed=None,
+          #deepspeed="None",
           lr_scheduler_type="cosine",
           warmup_ratio=0.1,
           report_to="wandb",
           bf16=False,
-          fp16=False,
+          fp16=True ,
            gradient_checkpointing=False,
     ddp_find_unused_parameters=False,
     ddp_broadcast_buffers=False,
@@ -437,7 +434,7 @@ def main():
     ds_high = load_dataset("haeunkim/final_dataset",split='train_high')
     dataset_total=concatenate_datasets([ds_low,ds_me,ds_high])
     ds_eval = load_dataset("haeunkim/final_dataset",split='eval')
-    n=int(len(dataset_total)*0.2)
+    n=int(len(dataset_total)*0.5)
     sft_lite = dataset_total.shuffle(seed=42).select(range(n))
     
     
@@ -460,8 +457,8 @@ def main():
     if args.model=='phi':
       base = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16)
     else:
-      base = AutoModelForCausalLM.from_pretrained(MODEL_NAME, quantization_config=bnb_config ,torch_dtype=torch.float16)
-    base = prepare_model_for_kbit_training(base)
+      base = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16)
+      #base = prepare_model_for_kbit_training(base)
     model =  get_peft_model(base, peft_config)
     model.config.use_cache = False
     
@@ -479,6 +476,7 @@ def main():
     
         
     return 
+  
   elif args.stage =="curriculum_lite":
      #curriculum sft
     
@@ -486,9 +484,9 @@ def main():
     ds_me   = load_dataset("haeunkim/final_dataset",split='train_medium')
     ds_high = load_dataset("haeunkim/final_dataset",split='train_high')
     ds_eval= load_dataset("haeunkim/final_dataset",split='eval')
-    n_low=int(len(ds_low)*0.4)
-    n_me=int(len(ds_me)*0.2)
-    n_high = int(len(ds_high)*0.1)
+    n_low=int(len(ds_low)*0.7)
+    n_me=int(len(ds_me)*0.5)
+    n_high = int(len(ds_high)*0.3)
     ds_sft_eval = ds_eval.map(
             sft_preprocess,
             batched=True,
@@ -521,8 +519,8 @@ def main():
         if args.model=='phi':
           base = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16)
         else:
-          base = AutoModelForCausalLM.from_pretrained(MODEL_NAME, quantization_config=bnb_config ,torch_dtype=torch.float16)
-          base = prepare_model_for_kbit_training(base)
+          base = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16)
+          #base = prepare_model_for_kbit_training(base)
         if prev_dir is None or not os.path.isdir(prev_dir):
             policy = get_peft_model(base, peft_config)
         else:
@@ -553,7 +551,7 @@ def main():
             save_steps=10,
             save_total_limit=3,
             bf16=False,
-            fp16=False,
+            fp16=True,
             optim="adamw_torch",
             packing=False,
             label_names=["labels"],
@@ -574,21 +572,22 @@ def main():
         
         trainer.train(resume_from_checkpoint=latest_ckpt or None)
 
-        # 8) ??
+    
         trainer.model.save_pretrained(stage_outdir)
         tokenizer.save_pretrained(stage_outdir)
 
     return
   
-  elif args.stage=='only_dpo':
-  
+  elif args.stage=='only_dpo_contrastive':
+    print("contrastive_dpo")
     ds_low = load_dataset("haeunkim/final_dataset",split='train_low')
     ds_me = load_dataset("haeunkim/final_dataset",split='train_medium')
     ds_high = load_dataset("haeunkim/final_dataset",split='train_high')
     ds_eval = load_dataset("haeunkim/final_dataset",split='eval')
-    raw=concatenate_datasets([ds_low,ds_me,ds_high])
-    n=int(len(raw)*0.2)
-    raw_dpo = raw.shuffle(seed=42).select(range(n))
+    raw_dpo=concatenate_datasets([ds_low,ds_me,ds_high])
+    #n=int(len(raw)*0.1)
+    #raw_dpo = raw.shuffle(seed=42).select(range(n))
+    
     ds_dpo = raw_dpo.map(lambda ex: dpo_preprocess(ex), batched=True,
                      remove_columns=raw_dpo.column_names, load_from_cache_file=True)
     ds_dpo_eval=ds_eval.map(lambda ex: dpo_preprocess(ex), batched=True,
@@ -596,24 +595,45 @@ def main():
     if args.model=='phi':
       base = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16)
     else:
+      #base = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16)
       base = AutoModelForCausalLM.from_pretrained(MODEL_NAME, quantization_config=bnb_config ,torch_dtype=torch.float16)
       base = prepare_model_for_kbit_training(base)
-    H = base.config.hidden_size
-    D = args.proj_dim or H
-    if args.two_layer:
-      proj_head = nn.Sequential(nn.Linear(H,H), nn.ReLU(), nn.Linear(H,D))
+   
+    if args.sft_dir:
+      policy_base=PeftModel.from_pretrained(base, args.sft_dir, is_trainable=True)
     else:
-      proj_head = nn.Linear(H, D, bias=False)
-    proj_head.to(next(base.parameters()).device).to(dtype=next(base.parameters()).dtype)
-    setattr(base, "proj_head", proj_head) 
-
-    policy_base = get_peft_model(base, peft_config)
+      policy_base = get_peft_model(base, peft_config)
     policy_base.config.use_cache = False
-    setattr(base, "proj_head", proj_head)
-        # 4) 
+    
     policy = Modelwithhead(policy_base)
     ref = build_ref(prev_outdir=None)
-    
+    dpo_config = DPOConfig(
+          output_dir=outdir,
+          per_device_train_batch_size=4 if args.model=='phi' else 1,          
+          gradient_accumulation_steps=8,           
+          num_train_epochs=args.epochs,
+          eval_strategy='steps',
+          eval_steps=500,
+          learning_rate=args.lr,
+          beta=args.beta,
+          max_prompt_length=128,
+          max_length=256,
+          save_steps=10,
+          save_total_limit=2,
+          logging_steps=10,
+          remove_unused_columns=False,
+          #deepspeed="configs/zero_stage_2.json",
+          #deepspeed="None",
+          lr_scheduler_type="cosine",
+          warmup_ratio=0.1,
+          report_to="wandb",
+          bf16=True,
+          fp16=False ,
+           gradient_checkpointing=False,
+    ddp_find_unused_parameters=False,
+    ddp_broadcast_buffers=False,
+           save_safetensors=True
+      )
     trainer = DPOContrastiveTrainer(
         model=policy,
         ref_model=ref,
@@ -624,72 +644,301 @@ def main():
         contrastive_weight=args.contra_weight ,
         project_dim=args.proj_dim,
         margin=args.margin,
-        two_layer_head=args.two_layer)
+        )
+        
+    
+    outdir = f"{args.output_dir}/{args.stage}"
+    os.makedirs(outdir, exist_ok=True)
+    latest_ckpt = get_latest_checkpoint(f"{args.output_dir}/{args.stage}")
+    trainer.train(resume_from_checkpoint=latest_ckpt or None)
+    trainer.model.save_pretrained(outdir)
+   
+    tokenizer.save_pretrained(outdir)
+   
+    return  
+  elif args.stage=='only_dpo':
+    print("only_dpo")
+    ds_low = load_dataset("haeunkim/final_dataset",split='train_low')
+    ds_me = load_dataset("haeunkim/final_dataset",split='train_medium')
+    ds_high = load_dataset("haeunkim/final_dataset",split='train_high')
+    ds_eval = load_dataset("haeunkim/final_dataset",split='eval')
+    raw_dpo=concatenate_datasets([ds_low,ds_me,ds_high])
+    
+    
+    ds_dpo = raw_dpo.map(lambda ex: dpo_preprocess(ex), batched=True,
+                     remove_columns=raw_dpo.column_names, load_from_cache_file=True)
+    ds_dpo_eval=ds_eval.map(lambda ex: dpo_preprocess(ex), batched=True,
+                     remove_columns=ds_eval.column_names, load_from_cache_file=True)
+    if args.model=='phi':
+      base = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16)
+    else:
+      base = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16)
+      #base = AutoModelForCausalLM.from_pretrained(MODEL_NAME, quantization_config=bnb_config ,torch_dtype=torch.float16)
+      #base = prepare_model_for_kbit_training(base)
+   
+    
+    policy_base = get_peft_model(base, peft_config)
+    policy_base.config.use_cache = False
+   
+    ref = build_ref(prev_outdir=None)
+    
+    trainer = DPOTrainer(
+        model=policy_base,
+        ref_model=ref,
+        args=dpo_config,
+        train_dataset=ds_dpo,
+        eval_dataset=ds_dpo_eval,
+        processing_class=tokenizer,  
+       )
         
                                         
-    if args.two_layer:
-      head_tag='mlp'
-    else:
-      head_tag='linear' 
-    if args.concat_forward:
-      concat_tag = "concat"
-    else:
-      concat_tag='separate'
-    outdir = f"{args.output_dir}/{head_tag}_{concat_tag}/margin_{args.margin}_weight_{args.contra_weight}_epoch_{args.epochs}"
+   
+    outdir = f"{args.output_dir}/{args.stage}"
     os.makedirs(outdir, exist_ok=True)
+    latest_ckpt = get_latest_checkpoint(f"{args.output_dir}/{args.stage}")
+    trainer.train(resume_from_checkpoint=latest_ckpt or None)
+    trainer.model.save_pretrained(outdir)
+   
+    tokenizer.save_pretrained(outdir)
     
+    return  
+  
+  elif args.stage=='sft_dpo':
+    ds_low = load_dataset("haeunkim/final_dataset",split='train_low')
+    ds_me = load_dataset("haeunkim/final_dataset",split='train_medium')
+    ds_high = load_dataset("haeunkim/final_dataset",split='train_high')
+    ds_eval = load_dataset("haeunkim/final_dataset",split='eval')
+    
+    n_total = len(ds_low) + len(ds_me) +len(ds_high)
+    w_low, w_me, w_high = 0.4, 0.35, 0.25  
+    n_target =int(n_total *0.2)
+    n_low  = int(n_target * w_low)
+    n_me   = int(n_target * w_me)
+    n_high = int(n_target * w_high)
+    
+    ds_low_small  = ds_low.shuffle(seed=42).select(range(n_low))
+    ds_me_small   = ds_me.shuffle(seed=42).select(range(n_me))
+    ds_high_small = ds_high.shuffle(seed=42).select(range(n_high))
+    ds_sft_eval=ds_eval.map(lambda ex: sft_preprocess(ex), batched=True,
+                     remove_columns=ds_eval.column_names, load_from_cache_file=True)
+    stages = [
+    ("low",    ds_low_small,  n_low,  None),
+    ("medium", ds_me_small,   n_me,   f"{args.output_dir}/{args.stage}/low"),
+    ("high",   ds_high_small, n_high, f"{args.output_dir}/{args.stage}/medium")
+]
+    for level, raw_ds, n_take, prev_dir in stages:
+        if n_take <= 0:
+            print(f"[curriculum_lite] skip {level}: n=0")
+            continue
+
+        
+        subset = raw_ds.shuffle(seed=42).select(range(min(n_take, len(raw_ds))))
+        ds_sft = subset.map(
+            sft_preprocess,
+            batched=True,
+            remove_columns=subset.column_names,
+            load_from_cache_file=True,
+        )
+        
+        ds_sft.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+
+        if args.model=='phi':
+          base = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16)
+        else:
+          base = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16)
+          #base = prepare_model_for_kbit_training(base)
+        if prev_dir is None or not os.path.isdir(prev_dir):
+            policy = get_peft_model(base, peft_config)
+        else:
+            policy = PeftModel.from_pretrained(base, prev_dir, is_trainable=True)
+        policy.config.use_cache = False
+        try:
+          policy.enable_input_require_grads()
+          policy.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
+        except Exception:
+          pass
+        
+        stage_outdir = os.path.join(args.output_dir, args.stage, level)
+        os.makedirs(stage_outdir, exist_ok=True)
+       
+        latest_ckpt = get_latest_checkpoint(stage_outdir)
+        is_high = (level == "high")
+        
+        eval_kwargs = (
+        dict(eval_strategy="steps", eval_steps=200)
+        if is_high else
+        dict(eval_strategy="no")
+)
+        
+        stage_cfg = SFTConfig(
+            output_dir=stage_outdir,
+            num_train_epochs=1,
+            per_device_train_batch_size=8,
+            gradient_accumulation_steps=1,
+            report_to="wandb",
+            learning_rate=2e-4,
+            logging_steps=10,
+            logging_dir="./logs",
+            save_strategy="steps",
+            save_steps=10,
+            save_total_limit=2,
+            bf16=False,
+            fp16=True,
+            optim="adamw_torch",
+            packing=False,
+            label_names=["labels"],
+            save_safetensors=True,
+            **eval_kwargs,
+            gradient_checkpointing=False,
+            ddp_find_unused_parameters=True,
+            ddp_broadcast_buffers=False,      
+            
+        )
+        # 7) ??
+        
+        trainer = SFTTrainer(
+            model=policy,
+            args=stage_cfg,
+            peft_config=None,       
+            train_dataset=ds_sft,
+            eval_dataset=ds_sft_eval if level == "high" else None,
+            processing_class=tokenizer,     
+        )
+        
+        trainer.train(resume_from_checkpoint=latest_ckpt or None)
+
+        # 8) ??
+        trainer.model.save_pretrained(stage_outdir)
+        tokenizer.save_pretrained(stage_outdir)
+    sft_final_dir=f"{args.output_dir}/{args.stage}/high"
+    raw=concatenate_datasets([ds_low,ds_me,ds_high])
+    n_ten=int(len(raw)*0.1)
+    raw_dpo = raw.shuffle(seed=42).select(range(n_ten))
+    ds_dpo = raw_dpo.map(lambda ex: dpo_preprocess(ex), batched=True,
+                     remove_columns=raw.column_names, load_from_cache_file=True)
+    ds_dpo_eval=ds_eval.map(lambda ex: dpo_preprocess(ex), batched=True,
+                     remove_columns=ds_eval.column_names, load_from_cache_file=True)
+    if args.model=='phi':
+      base = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME, torch_dtype=torch.float16
+    )
+    else:
+      base = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME, torch_dtype=torch.float16,quantization_config=bnb_config
+    )  
+      base=prepare_model_for_kbit_training(base)
+    policy_base =PeftModel.from_pretrained(base, sft_final_dir, is_trainable=True)
+    policy_base.config.use_cache = False
+    
+    policy = Modelwithhead(policy_base)
+    ref = build_ref(prev_outdir=None)
+    
+    dpo_config = DPOConfig(
+          output_dir=outdir,
+          per_device_train_batch_size=4 if args.model=='phi' else 1,          
+          gradient_accumulation_steps=8,           
+          num_train_epochs=args.epochs,
+          eval_strategy='steps',
+          eval_steps=500,
+          learning_rate=args.lr,
+          beta=args.beta,
+          max_prompt_length=128,
+          max_length=256,
+          save_steps=10,
+          save_total_limit=2,
+          logging_steps=10,
+          remove_unused_columns=False,
+          #deepspeed="configs/zero_stage_2.json",
+          #deepspeed="None",
+          lr_scheduler_type="cosine",
+          warmup_ratio=0.1,
+          report_to="wandb",
+          bf16=True,
+          fp16=False ,
+           gradient_checkpointing=False,
+    ddp_find_unused_parameters=False,
+    ddp_broadcast_buffers=False,
+           save_safetensors=True,
+           max_grad_norm=0.0
+      )
+  
+  
+    trainer = DPOContrastiveTrainer(
+        model=policy,
+        ref_model=ref,
+        args=dpo_config,
+        train_dataset=ds_dpo,
+        eval_dataset=ds_dpo_eval,
+        processing_class=tokenizer,  
+        contrastive_weight=args.contra_weight ,
+        project_dim=args.proj_dim,
+        margin=args.margin,
+       )
+        
+                                        
+    
+    outdir = os.path.join(args.output_dir, args.stage, "dpo_contrastive")
+    os.makedirs(outdir, exist_ok=True)
+    #latest_ckpt = get_latest_checkpoint(f"{args.output_dir}/{args.stage}")
     trainer.train()
     trainer.model.save_pretrained(outdir)
    
     tokenizer.save_pretrained(outdir)
-    with open(os.path.join(outdir, "train_config.txt"), "w") as f:
-      f.write(f"margin={args.margin}\n")
-      f.write(f"contra_weight={args.contra_weight}\n")
-      f.write(f"epochs={args.epochs}\n")
-      f.write(f"learning_rate={args.lr}\n")
-      f.write(f"beta={args.beta}\n")
+    
+      
     return  
-   
-  #after sft
-  else:
-    ds_low = load_dataset("haeunkim/curriculum_learning_dpo_negative",split='train_low')
-    ds_me = load_dataset("haeunkim/curriculum_learning_dpo_negative",split='train_medium')
-    ds_high = load_dataset("haeunkim/curriculum_learning_dpo_negative",split='train_high')
+  elif args.stage=='dpo':
+    print('dpo')
+    ds_low = load_dataset("haeunkim/final_dataset",split='train_low')
+    ds_me = load_dataset("haeunkim/final_dataset",split='train_medium')
+    ds_high = load_dataset("haeunkim/final_dataset",split='train_high')
+    ds_eval = load_dataset("haeunkim/final_dataset",split='eval')
+    if args.sft_dir:
+      sft_final_dir=args.sft_dir
+    print(sft_final_dir)
     raw=concatenate_datasets([ds_low,ds_me,ds_high])
-    ds_dpo = raw.map(lambda ex: dpo_preprocess(ex), batched=True,
+    n_ten=int(len(raw)*0.1)
+    raw_dpo = raw.shuffle(seed=42).select(range(n_ten))
+    ds_dpo = raw_dpo.map(lambda ex: dpo_preprocess(ex), batched=True,
                      remove_columns=raw.column_names, load_from_cache_file=True)
+    ds_dpo_eval=ds_eval.map(lambda ex: dpo_preprocess(ex), batched=True,
+                     remove_columns=ds_eval.column_names, load_from_cache_file=True)
     
     base = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME, torch_dtype=torch.float16
     )
-    base = prepare_model_for_kbit_training(base)
-    policy = get_peft_model(base, peft_config)
-    ref    = build_ref(prev_outdir=None)
+    policy =PeftModel.from_pretrained(base, sft_final_dir, is_trainable=True)
     policy.config.use_cache = False
+    
+    
+    ref = build_ref(prev_outdir=None)
+    
     trainer = DPOTrainer(
         model=policy,
         ref_model=ref,
         args=dpo_config,
         train_dataset=ds_dpo,
-        eval_dataset=None,
+        eval_dataset=ds_dpo_eval,
         processing_class=tokenizer,  
-        contrastive_weight=args.contra_weight ,
-        project_dim=args.proj_dim,
-        margin=args.margin,
-        concat_forward=args.concat_forward,
-        two_layer_head=args.two_layer)
+        )
+        
+                                        
+    
+    outdir = os.path.join(args.output_dir, args.stage, "sft_simple_dpo")
+    os.makedirs(outdir, exist_ok=True)
+    #latest_ckpt = get_latest_checkpoint(f"{args.output_dir}/{args.stage}")
     trainer.train()
     trainer.model.save_pretrained(outdir)
    
-    tokenizer.save_pretrained(outdir)   
+    tokenizer.save_pretrained(outdir)
+        
 if __name__ == "__main__":
     main()
 
     
   
     
-#sft /sample dpo
-#sft /curriculum dpo -sample dpo (10%) 
-#curriculum sft /sample dpo
-#without sft dpo 
+
 
